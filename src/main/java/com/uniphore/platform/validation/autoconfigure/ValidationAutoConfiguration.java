@@ -1,5 +1,6 @@
 package com.uniphore.platform.validation.autoconfigure;
 
+import com.uniphore.platform.validation.aspect.FieldConstraintsAspect;
 import com.uniphore.platform.validation.filter.HeaderValidationFilter;
 import com.uniphore.platform.validation.handler.ValidationExceptionHandler;
 import com.uniphore.platform.validation.properties.ValidationProperties;
@@ -39,6 +40,12 @@ public class ValidationAutoConfiguration {
         registration.addUrlPatterns("/*");
         registration.setName("headerValidationFilter");
         return registration;
+    }
+
+    @Bean
+    @ConditionalOnMissingBean(FieldConstraintsAspect.class)
+    public FieldConstraintsAspect fieldConstraintsAspect() {
+        return new FieldConstraintsAspect();
     }
 
     @Bean

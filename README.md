@@ -26,6 +26,7 @@ with zero boilerplate integration.
 - Per-endpoint header overrides via `@ValidateHeader`
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
+- Per-endpoint field allowed-value rules via `@FieldConstraints` / `@FieldRule`
 
 ---
 
@@ -287,6 +288,117 @@ public class UpdateProfileRequest {
 
 ---
 
+### `@FieldConstraints` / `@FieldRule`
+
+Declares allowed-value rules for request body fields directly on the controller method (or class).
+No DTO changes are required — the rules live next to the API definition. Validation is enforced by
+an AOP aspect that intercepts the method before it executes, inspects the `@RequestBody` argument
+via reflection, and throws a `BodyValidationException` if any field contains a disallowed value.
+
+```java
+public @interface FieldConstraints {
+    FieldRule[] value();
+}
+
+public @interface FieldRule {
+    String   field();                    // field name in the request body object
+    String[] values();                   // exhaustive list of allowed values
+    boolean  ignoreCase() default false; // case-insensitive comparison
+    String   message()    default "";    // custom error message (auto-generated if blank)
+}
+```
+
+**Example — method-level:**
+
+```java
+@FieldConstraints({
+    @FieldRule(field = "status",   values = {"ACTIVE", "INACTIVE", "PENDING"}),
+    @FieldRule(field = "priority", values = {"LOW", "MEDIUM", "HIGH"}, ignoreCase = true)
+})
+@PostMapping("/orders")
+public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) {
+    // Reaches here only if status and priority are valid
+}
+```
+
+**Example — class-level (applies to every method in the controller):**
+
+```java
+@RestController
+@RequestMapping("/api/accounts")
+@FieldConstraints({
+    @FieldRule(field = "type", values = {"PERSONAL", "BUSINESS"})
+})
+public class AccountController {
+
+    @PostMapping
+    public ResponseEntity<Account> create(@RequestBody @Valid CreateAccountRequest req) { ... }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<Account> update(@PathVariable String id,
+                                          @RequestBody @Valid UpdateAccountRequest req) { ... }
+}
+```
+
+**Example — method-level overrides class-level:**
+
+```java
+@RestController
+@FieldConstraints({
+    @FieldRule(field = "status", values = {"DRAFT", "PUBLISHED"})
+})
+public class ContentController {
+
+    // Uses class-level rule: status must be DRAFT or PUBLISHED
+    @PostMapping("/articles")
+    public ResponseEntity<Article> createArticle(@RequestBody @Valid ArticleRequest req) { ... }
+
+    // Method-level wins — status can also be ARCHIVED on this endpoint
+    @PutMapping("/articles/{id}")
+    @FieldConstraints({
+        @FieldRule(field = "status", values = {"DRAFT", "PUBLISHED", "ARCHIVED"})
+    })
+    public ResponseEntity<Article> updateArticle(@PathVariable String id,
+                                                 @RequestBody @Valid ArticleRequest req) { ... }
+}
+```
+
+**Behaviour:**
+
+| Scenario | Result |
+|---|---|
+| Field value is in the allowed list | Passes |
+| Field value is not in the allowed list | Fails — `400 Bad Request` with field-level error |
+| Field value is `null` | Passes — pair with `@NotNull` on the DTO to reject null |
+| `field` name does not exist on the DTO | Warning logged, rule skipped silently |
+| Multiple fields fail | All violations reported at once (not fail-fast) |
+| `ignoreCase = true` | `"active"`, `"ACTIVE"`, `"Active"` are all treated as equal |
+
+The error response follows the standard envelope, for example:
+
+```json
+{
+  "timestamp": "2025-04-01T10:23:45.123Z",
+  "status": 400,
+  "error": "Bad Request",
+  "message": "Field value validation failed",
+  "traceId": "abc-123",
+  "tenantId": "tenant-uuid",
+  "errors": [
+    {
+      "field": "status",
+      "message": "Value 'DELETED' is not allowed. Allowed values: [ACTIVE, INACTIVE, PENDING]"
+    },
+    {
+      "field": "priority",
+      "message": "Value 'CRITICAL' is not allowed. Allowed values: [LOW, MEDIUM, HIGH]"
+    }
+  ]
+}
+```
+
+---
+
 ## Error Response Format
 
 All validation failures return a consistent JSON envelope:
@@ -327,6 +439,7 @@ All validation failures return a consistent JSON envelope:
 | Missing globally required custom header (from properties) | `400 Bad Request` |
 | Missing per-endpoint `@ValidateHeader` header | `422 Unprocessable Entity` |
 | JSR-303 `@Valid` body validation failure | `400 Bad Request` |
+| `@FieldConstraints` / `@FieldRule` value violation | `400 Bad Request` |
 
 ---
 
@@ -427,7 +540,11 @@ api-validation-framework/
     │   │   ├── annotation/
     │   │   │   ├── ValidateHeader.java         # Repeatable per-endpoint header requirement
     │   │   │   ├── ValidateHeaders.java        # Container annotation (compiler-generated)
-    │   │   │   └── SkipValidation.java         # Opt-out on a specific endpoint
+    │   │   │   ├── SkipValidation.java         # Opt-out on a specific endpoint
+    │   │   │   ├── FieldConstraints.java       # Per-endpoint field allowed-value rules
+    │   │   │   └── FieldRule.java              # Single field → allowed values declaration
+    │   │   ├── aspect/
+    │   │   │   └── FieldConstraintsAspect.java # AOP aspect enforcing @FieldConstraints rules
     │   │   ├── autoconfigure/
     │   │   │   └── ValidationAutoConfiguration.java  # Spring Boot auto-configuration entry point
     │   │   ├── exception/
