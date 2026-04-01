@@ -3,8 +3,6 @@ package com.uniphore.platform.validation.filter;
 import com.uniphore.platform.validation.annotation.HeaderConstraints;
 import com.uniphore.platform.validation.annotation.HeaderRule;
 import com.uniphore.platform.validation.annotation.SkipValidation;
-import com.uniphore.platform.validation.annotation.ValidateHeader;
-import com.uniphore.platform.validation.annotation.ValidateHeaders;
 import com.uniphore.platform.validation.exception.HeaderValidationException;
 import com.uniphore.platform.validation.properties.ValidationProperties;
 import jakarta.servlet.FilterChain;
@@ -19,7 +17,6 @@ import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandl
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -34,7 +31,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
  *   <li>Authorization header — presence + Bearer prefix + non-empty token</li>
  *   <li>Content-Type — prefix match on POST/PUT/PATCH</li>
  *   <li>Global required custom headers (from properties)</li>
- *   <li>Per-endpoint {@code @ValidateHeader} annotations</li>
+ *   <li>Per-endpoint {@link HeaderConstraints} / {@link HeaderRule} annotations</li>
  * </ol>
  */
 public class HeaderValidationFilter extends OncePerRequestFilter {
@@ -114,7 +111,7 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             }
         }
 
-        // Step 5c — inline @HeaderRule entries from @HeaderConstraints
+        // Step 6 — inline @HeaderRule entries from @HeaderConstraints
         if (headerConstraints != null) {
             for (HeaderRule rule : headerConstraints.value()) {
                 String value = request.getHeader(rule.name());
@@ -131,11 +128,6 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
                     throw new HeaderValidationException(msg, HttpStatus.BAD_REQUEST, rule.name());
                 }
             }
-        }
-
-        // Step 6 — per-endpoint @ValidateHeader annotations (backward compatible)
-        if (handlerMethod != null) {
-            validatePerEndpointHeaders(request, handlerMethod);
         }
 
         filterChain.doFilter(request, response);
@@ -220,45 +212,5 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             return methodLevel;
         }
         return handlerMethod.getBeanType().getAnnotation(HeaderConstraints.class);
-    }
-
-    private void validatePerEndpointHeaders(HttpServletRequest request, HandlerMethod handlerMethod) {
-        // Collect annotations: class-level first, then method-level (method overrides class)
-        ValidateHeader[] classAnnotations = getValidateHeaders(handlerMethod.getBeanType());
-        ValidateHeader[] methodAnnotations = getValidateHeaders(handlerMethod.getMethod());
-
-        // Build effective map: method-level wins over class-level for same header name
-        Map<String, ValidateHeader> effective = new java.util.LinkedHashMap<>();
-        for (ValidateHeader ann : classAnnotations) {
-            effective.put(ann.name(), ann);
-        }
-        for (ValidateHeader ann : methodAnnotations) {
-            effective.put(ann.name(), ann);  // override class-level
-        }
-
-        for (ValidateHeader ann : effective.values()) {
-            String value = request.getHeader(ann.name());
-            if (ann.required() && (value == null || value.isBlank())) {
-                String msg = ann.message().isBlank()
-                        ? "Required header '" + ann.name() + "' is missing or blank"
-                        : ann.message();
-                throw new HeaderValidationException(msg, HttpStatus.UNPROCESSABLE_ENTITY, ann.name());
-            }
-            if (value != null && ann.notBlank() && value.isBlank()) {
-                String msg = ann.message().isBlank()
-                        ? "Header '" + ann.name() + "' must not be blank"
-                        : ann.message();
-                throw new HeaderValidationException(msg, HttpStatus.UNPROCESSABLE_ENTITY, ann.name());
-            }
-        }
-    }
-
-    private ValidateHeader[] getValidateHeaders(java.lang.reflect.AnnotatedElement element) {
-        ValidateHeaders container = element.getAnnotation(ValidateHeaders.class);
-        if (container != null) {
-            return container.value();
-        }
-        ValidateHeader single = element.getAnnotation(ValidateHeader.class);
-        return single != null ? new ValidateHeader[]{single} : new ValidateHeader[0];
     }
 }

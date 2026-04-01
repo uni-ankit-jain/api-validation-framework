@@ -1,8 +1,7 @@
 # api-validation-framework
 
 A shared Spring Boot auto-configuration library that provides consistent HTTP header validation,
-standardized error responses, and reusable JSR-303 constraint annotations across all Uniphore
-microservices.
+request body field validation, and standardized error responses across all Uniphore microservices.
 
 ---
 
@@ -22,9 +21,8 @@ with zero boilerplate integration.
 
 **What it adds via opt-in configuration:**
 
-- Per-service required custom headers (e.g. `X-Tenant-ID`)
-- Per-endpoint consolidated header rules via `@HeaderConstraints` + inline `@HeaderRule` entries
-- Per-endpoint header overrides via `@ValidateHeader` *(deprecated — use `@HeaderConstraints`)*
+- Per-service required custom headers (e.g. `X-Tenant-ID`) via properties
+- Per-endpoint header rules via `@HeaderConstraints` + inline `@HeaderRule` entries
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
 - Per-endpoint field allowed-value rules via `@FieldConstraints` / `@FieldRule`
@@ -78,37 +76,28 @@ uniphore.validation.enabled=false
 # Keep your existing AppExceptionHandler as the authoritative error formatter
 uniphore.validation.exception-handler.enabled=false
 
-# Require X-Tenant-ID on every request (except bypass paths)
-uniphore.validation.custom-headers.required=X-Tenant-ID
-
-# Require both X-Tenant-ID and X-Correlation-ID
+# Require X-Tenant-ID and X-Correlation-ID on every request (except bypass paths)
 uniphore.validation.custom-headers.required=X-Tenant-ID,X-Correlation-ID
 ```
 
-### Step 3 — Per-endpoint overrides (optional)
+### Step 3 — Per-endpoint header rules (optional)
+
+Use `@HeaderConstraints` with inline `@HeaderRule` entries to declare all header requirements
+for an endpoint in one place:
 
 ```java
-// Require an additional header only on this endpoint
-@PostMapping("/api/conversations")
-@ValidateHeader(name = "X-Request-Source", required = true)
-public ResponseEntity<ConversationDto> create(@Valid @RequestBody CreateRequest req) {
-    // ...
-}
-
-// Require multiple extra headers on this endpoint
-@PostMapping("/api/transfers")
-@ValidateHeader(name = "X-Idempotency-Key", required = true)
-@ValidateHeader(name = "X-Request-Source", required = true)
-public ResponseEntity<TransferDto> transfer(@Valid @RequestBody TransferRequest req) {
-    // ...
-}
+@HeaderConstraints({
+    @HeaderRule(name = "X-Tenant-ID"),
+    @HeaderRule(name = "X-Correlation-ID"),
+    @HeaderRule(name = "X-Source", required = false)  // present → non-blank; absent → OK
+})
+@PostMapping("/api/orders")
+public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) { ... }
 
 // Skip all validation on a public / webhook endpoint
+@HeaderConstraints(skipAuth = true)
 @PostMapping("/webhooks/inbound")
-@SkipValidation
-public ResponseEntity<Void> handleWebhook(@RequestBody String payload) {
-    // ...
-}
+public ResponseEntity<Void> handleWebhook(@RequestBody String payload) { ... }
 ```
 
 ### Step 4 — Integrating with an existing `AppExceptionHandler` (optional)
@@ -180,95 +169,49 @@ uniphore.validation.exception-handler.enabled=true
 
 ## Annotations
 
-### `@ValidateHeader`
-
-Declares a required (or conditionally required) HTTP header for a controller method or class.
-Repeatable — multiple headers can be stacked on the same element. Method-level declarations
-override class-level declarations for the same header name.
-
-```java
-@Target({ElementType.METHOD, ElementType.TYPE})
-@Repeatable(ValidateHeaders.class)
-public @interface ValidateHeader {
-    String name();                     // header name, e.g. "X-Tenant-ID"
-    boolean required() default true;   // fail if header is absent
-    boolean notBlank() default true;   // fail if header is present but blank
-    String message() default "";       // custom error message (auto-generated if blank)
-}
-```
-
-**Examples:**
-
-```java
-// Class-level — applies to all methods unless overridden
-@RestController
-@RequestMapping("/api/reports")
-@ValidateHeader(name = "X-Report-Context", required = true)
-public class ReportController {
-
-    // Inherits X-Report-Context requirement from class
-    @GetMapping
-    public List<Report> list() { ... }
-
-    // Adds X-Export-Format on top of the class-level requirement
-    @GetMapping("/export")
-    @ValidateHeader(name = "X-Export-Format", required = true, message = "Specify export format: csv or pdf")
-    public ResponseEntity<byte[]> export() { ... }
-}
-```
-
-Responses when validation fails use HTTP **422 Unprocessable Entity**.
-
----
-
 ### `@HeaderConstraints` / `@HeaderRule`
 
-Consolidates all HTTP header validation rules into a single annotation using inline `@HeaderRule`
-elements — the same pattern as `@FieldConstraints` / `@FieldRule`. Replaces stacked `@ValidateHeader`
-annotations and scattered `application.properties` entries. When placed on a class, applies to every
-handler method within it. A method-level annotation takes full precedence over a class-level one.
+Declares all HTTP header validation rules for a controller method or class in one place.
+Inline `@HeaderRule` elements cover required headers, optional-but-non-blank headers, and custom
+error messages. `@HeaderConstraints` also lets you override the Authorization and Content-Type
+behavior per endpoint. When placed on a class, applies to every handler method within it; a
+method-level annotation takes full precedence over a class-level one.
 
 ```java
 public @interface HeaderConstraints {
-    HeaderRule[] value()           default {};  // inline per-header rules
-    boolean      skipAuth()        default false;  // skip Authorization check for this endpoint
+    HeaderRule[] value()            default {};    // inline per-header rules
+    boolean      skipAuth()         default false; // skip Authorization check for this endpoint
     String[]     allowedContentTypes() default {}; // override global Content-Type list
 }
 
 public @interface HeaderRule {
-    String  name();                  // header name, e.g. "X-Tenant-ID"
-    boolean required() default true; // must be present and non-blank
-    boolean notBlank() default true; // must be non-blank when present (applies when required=false too)
-    String  message()  default "";   // custom error message (auto-generated if blank)
+    String  name();                   // header name, e.g. "X-Tenant-ID"
+    boolean required() default true;  // must be present and non-blank
+    boolean notBlank() default true;  // must be non-blank when present
+    String  message()  default "";    // custom error message (auto-generated if blank)
 }
 ```
 
-**Example — consolidate all rules in one place:**
+**Example — required and optional headers:**
 
 ```java
-// Before: scattered across properties + stacked annotations
-// uniphore.validation.custom-headers.required=X-Tenant-ID
-// uniphore.validation.content-type.allowed-types=application/json,application/xml
-@ValidateHeader(name = "X-Correlation-ID", required = true)
-@ValidateHeader(name = "X-Source", notBlank = false)
-
-// After: single annotation with inline rules
-@HeaderConstraints(
-    value = {
-        @HeaderRule(name = "X-Tenant-ID"),
-        @HeaderRule(name = "X-Correlation-ID"),
-        @HeaderRule(name = "X-Source", required = false)  // present → non-blank; absent → OK
-    },
-    allowedContentTypes = {"application/json", "application/xml"}
-)
+@HeaderConstraints({
+    @HeaderRule(name = "X-Tenant-ID"),
+    @HeaderRule(name = "X-Correlation-ID"),
+    @HeaderRule(name = "X-Source", required = false)   // absent → OK; present → non-blank
+})
 @PostMapping("/orders")
 public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) { ... }
 ```
 
-**Example — public endpoint that skips Authorization:**
+**Example — override Content-Type and skip Authorization:**
 
 ```java
-@HeaderConstraints(skipAuth = true)
+@HeaderConstraints(
+    value               = { @HeaderRule(name = "X-Tenant-ID") },
+    skipAuth            = true,
+    allowedContentTypes = {"application/xml"}
+)
 @PostMapping("/webhooks/inbound")
 public ResponseEntity<Void> handleWebhook(@RequestBody String payload) { ... }
 ```
@@ -310,9 +253,6 @@ public class ReportController {
 | `allowedContentTypes` non-empty | Replaces `content-type.allowed-types` for this endpoint only |
 | `allowedContentTypes` empty (default) | Falls through to the global `content-type.allowed-types` list |
 
-> **`@ValidateHeader` is deprecated** in favour of `@HeaderConstraints` + `@HeaderRule`.
-> It remains fully supported for backward compatibility but will be removed in a future version.
-
 ---
 
 ### `@SkipValidation`
@@ -353,7 +293,6 @@ public class CreateConversationRequest {
     @SafeString(pattern = "^[a-zA-Z0-9 _-]+$")
     private String title;
 
-    // Allow letters, numbers, spaces, and common punctuation
     @SafeString(pattern = "^[\\w\\s.,!?'-]+$", message = "Description contains unsupported characters")
     private String description;
 }
@@ -385,10 +324,10 @@ public class UpdateProfileRequest {
 
 ### `@FieldConstraints` / `@FieldRule`
 
-Declares allowed-value rules for request body fields directly on the controller method (or class).
-No DTO changes are required — the rules live next to the API definition. Validation is enforced by
-an AOP aspect that intercepts the method before it executes, inspects the `@RequestBody` argument
-via reflection, and throws a `BodyValidationException` if any field contains a disallowed value.
+Declares allowed-value rules for request body fields directly on the controller method or class.
+No DTO changes required — rules live next to the API definition. Validation is enforced by an AOP
+aspect that inspects the `@RequestBody` argument via reflection and throws a `BodyValidationException`
+if any field contains a disallowed value.
 
 ```java
 public @interface FieldConstraints {
@@ -411,9 +350,7 @@ public @interface FieldRule {
     @FieldRule(field = "priority", values = {"LOW", "MEDIUM", "HIGH"}, ignoreCase = true)
 })
 @PostMapping("/orders")
-public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) {
-    // Reaches here only if status and priority are valid
-}
+public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) { ... }
 ```
 
 **Example — class-level (applies to every method in the controller):**
@@ -444,7 +381,6 @@ public class AccountController {
 })
 public class ContentController {
 
-    // Uses class-level rule: status must be DRAFT or PUBLISHED
     @PostMapping("/articles")
     public ResponseEntity<Article> createArticle(@RequestBody @Valid ArticleRequest req) { ... }
 
@@ -469,29 +405,6 @@ public class ContentController {
 | Multiple fields fail | All violations reported at once (not fail-fast) |
 | `ignoreCase = true` | `"active"`, `"ACTIVE"`, `"Active"` are all treated as equal |
 
-The error response follows the standard envelope, for example:
-
-```json
-{
-  "timestamp": "2025-04-01T10:23:45.123Z",
-  "status": 400,
-  "error": "Bad Request",
-  "message": "Field value validation failed",
-  "traceId": "abc-123",
-  "tenantId": "tenant-uuid",
-  "errors": [
-    {
-      "field": "status",
-      "message": "Value 'DELETED' is not allowed. Allowed values: [ACTIVE, INACTIVE, PENDING]"
-    },
-    {
-      "field": "priority",
-      "message": "Value 'CRITICAL' is not allowed. Allowed values: [LOW, MEDIUM, HIGH]"
-    }
-  ]
-}
-```
-
 ---
 
 ## Error Response Format
@@ -501,15 +414,15 @@ All validation failures return a consistent JSON envelope:
 ```json
 {
   "timestamp": "2025-04-01T10:23:45.123Z",
-  "status": 401,
-  "error": "Unauthorized",
-  "message": "Authorization header is required",
+  "status": 400,
+  "error": "Bad Request",
+  "message": "Required header 'X-Tenant-ID' is missing or blank",
   "traceId": "abc-123",
   "tenantId": "tenant-uuid",
   "errors": [
     {
-      "field": "Authorization",
-      "message": "Authorization header is required"
+      "field": "X-Tenant-ID",
+      "message": "Required header 'X-Tenant-ID' is missing or blank"
     }
   ]
 }
@@ -523,7 +436,7 @@ All validation failures return a consistent JSON envelope:
 | `message` | Human-readable summary |
 | `traceId` | Resolved from MDC key `auditTraceId`, falls back to request attribute `traceId` |
 | `tenantId` | Resolved from MDC key `auditTenantId`, falls back to request attribute `tenantId` |
-| `errors` | Array of per-field or per-header errors; omitted when empty |
+| `errors` | Array of per-field or per-header errors |
 
 ### HTTP status codes used
 
@@ -531,8 +444,7 @@ All validation failures return a consistent JSON envelope:
 |---|---|
 | Missing or malformed `Authorization` header | `401 Unauthorized` |
 | Missing or disallowed `Content-Type` | `400 Bad Request` |
-| Missing globally required custom header (from properties) | `400 Bad Request` |
-| Missing per-endpoint `@ValidateHeader` header | `422 Unprocessable Entity` |
+| Missing required custom header (properties or `@HeaderConstraints`) | `400 Bad Request` |
 | JSR-303 `@Valid` body validation failure | `400 Bad Request` |
 | `@FieldConstraints` / `@FieldRule` value violation | `400 Bad Request` |
 
@@ -633,13 +545,11 @@ api-validation-framework/
     ├── main/
     │   ├── java/com/uniphore/platform/validation/
     │   │   ├── annotation/
-    │   │   │   ├── HeaderConstraints.java      # Consolidated per-endpoint header rules
-    │   │   │   ├── HeaderRule.java             # Single header rule (inline inside @HeaderConstraints)
-    │   │   │   ├── ValidateHeader.java         # (deprecated) Repeatable per-endpoint header requirement
-    │   │   │   ├── ValidateHeaders.java        # (deprecated) Container for @ValidateHeader
-    │   │   │   ├── SkipValidation.java         # Opt-out on a specific endpoint
-    │   │   │   ├── FieldConstraints.java       # Per-endpoint field allowed-value rules
-    │   │   │   └── FieldRule.java              # Single field → allowed values declaration
+    │   │   │   ├── HeaderConstraints.java      # Per-endpoint header rules container
+    │   │   │   ├── HeaderRule.java             # Inline header rule (name, required, notBlank, message)
+    │   │   │   ├── SkipValidation.java         # Opt-out all validation on a specific endpoint
+    │   │   │   ├── FieldConstraints.java       # Per-endpoint field allowed-value rules container
+    │   │   │   └── FieldRule.java              # Inline field rule (field, values, ignoreCase, message)
     │   │   ├── aspect/
     │   │   │   └── FieldConstraintsAspect.java # AOP aspect enforcing @FieldConstraints rules
     │   │   ├── autoconfigure/

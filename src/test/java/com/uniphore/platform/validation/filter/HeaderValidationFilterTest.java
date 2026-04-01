@@ -1,7 +1,8 @@
 package com.uniphore.platform.validation.filter;
 
+import com.uniphore.platform.validation.annotation.HeaderConstraints;
+import com.uniphore.platform.validation.annotation.HeaderRule;
 import com.uniphore.platform.validation.annotation.SkipValidation;
-import com.uniphore.platform.validation.annotation.ValidateHeader;
 import com.uniphore.platform.validation.exception.HeaderValidationException;
 import com.uniphore.platform.validation.properties.ValidationProperties;
 import jakarta.servlet.FilterChain;
@@ -234,16 +235,16 @@ class HeaderValidationFilterTest {
     }
 
     // -----------------------------------------------------------------------
-    // @ValidateHeader (per-endpoint)
+    // @HeaderConstraints / @HeaderRule (per-endpoint)
     // -----------------------------------------------------------------------
 
     @Test
-    void shouldThrow422WhenPerEndpointRequiredHeaderMissing() throws Exception {
+    void shouldThrow400WhenHeaderConstraintsRequiredHeaderMissing() throws Exception {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/conversations");
         request.addHeader("Authorization", "Bearer valid-token");
         MockHttpServletResponse response = new MockHttpServletResponse();
 
-        HandlerMethod handlerMethod = mockHandlerMethodWithValidateHeader("X-Source", true);
+        HandlerMethod handlerMethod = buildHandlerMethod(TestController.class, "headerConstraintsMethod");
         when(handlerMapping.getHandler(any()))
                 .thenReturn(new HandlerExecutionChain(handlerMethod));
 
@@ -251,9 +252,40 @@ class HeaderValidationFilterTest {
                 .isInstanceOf(HeaderValidationException.class)
                 .satisfies(ex -> {
                     HeaderValidationException hve = (HeaderValidationException) ex;
-                    assertThat(hve.getHttpStatus()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+                    assertThat(hve.getHttpStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
                     assertThat(hve.getHeaderName()).isEqualTo("X-Source");
                 });
+    }
+
+    @Test
+    void shouldPassWhenHeaderConstraintsRequiredHeaderPresent() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/conversations");
+        request.addHeader("Authorization", "Bearer valid-token");
+        request.addHeader("X-Source", "mobile");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        HandlerMethod handlerMethod = buildHandlerMethod(TestController.class, "headerConstraintsMethod");
+        when(handlerMapping.getHandler(any()))
+                .thenReturn(new HandlerExecutionChain(handlerMethod));
+
+        filter.doFilterInternal(request, response, filterChain);
+
+        verify(filterChain).doFilter(request, response);
+    }
+
+    @Test
+    void shouldSkipAuthWhenHeaderConstraintsSkipAuthTrue() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/public");
+        // No Authorization header
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        HandlerMethod handlerMethod = buildHandlerMethod(TestController.class, "skipAuthMethod");
+        when(handlerMapping.getHandler(any()))
+                .thenReturn(new HandlerExecutionChain(handlerMethod));
+
+        filter.doFilterInternal(request, response, filterChain);
+
+        verify(filterChain).doFilter(request, response);
     }
 
     // -----------------------------------------------------------------------
@@ -281,10 +313,6 @@ class HeaderValidationFilterTest {
         return buildHandlerMethod(TestController.class, "skipMethod");
     }
 
-    private HandlerMethod mockHandlerMethodWithValidateHeader(String headerName, boolean required) throws Exception {
-        return buildHandlerMethod(TestController.class, "validateHeaderMethod");
-    }
-
     private HandlerMethod buildHandlerMethod(Class<?> controllerClass, String methodName) throws Exception {
         Object controller = controllerClass.getDeclaredConstructor().newInstance();
         Method method = controllerClass.getMethod(methodName);
@@ -298,8 +326,12 @@ class HeaderValidationFilterTest {
         public void skipMethod() {
         }
 
-        @ValidateHeader(name = "X-Source", required = true)
-        public void validateHeaderMethod() {
+        @HeaderConstraints({ @HeaderRule(name = "X-Source") })
+        public void headerConstraintsMethod() {
+        }
+
+        @HeaderConstraints(skipAuth = true)
+        public void skipAuthMethod() {
         }
     }
 }
