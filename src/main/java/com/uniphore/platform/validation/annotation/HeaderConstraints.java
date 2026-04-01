@@ -7,9 +7,9 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Consolidates all header validation rules for a controller method or class into a single
- * annotation, replacing the need to stack multiple {@link ValidateHeader} annotations and
- * scatter related config across {@code application.properties}.
+ * Consolidates all HTTP header validation rules for a controller method or class into a
+ * single annotation. Inline {@link HeaderRule} elements replace the need for stacked
+ * {@link ValidateHeader} annotations or scattered {@code application.properties} entries.
  *
  * <p>When placed on a class, applies to every handler method within it.
  * A method-level annotation takes full precedence over a class-level one.
@@ -17,8 +17,11 @@ import java.lang.annotation.Target;
  * <p>Example:
  * <pre>{@code
  * @HeaderConstraints(
- *     required            = {"X-Tenant-ID", "X-Correlation-ID"},
- *     notBlankIfPresent   = {"X-Source"},
+ *     value = {
+ *         @HeaderRule(name = "X-Tenant-ID"),
+ *         @HeaderRule(name = "X-Correlation-ID"),
+ *         @HeaderRule(name = "X-Source", required = false)   // notBlankIfPresent
+ *     },
  *     skipAuth            = false,
  *     allowedContentTypes = {"application/json", "application/xml"}
  * )
@@ -28,12 +31,12 @@ import java.lang.annotation.Target;
  *
  * <p>Interaction with global properties:
  * <ul>
+ *   <li>{@link HeaderRule} entries apply in addition to globally configured
+ *       {@code custom-headers.required} / {@code custom-headers.not-blank-if-present}.</li>
  *   <li>{@link #skipAuth()} overrides {@code uniphore.validation.authorization-header.required}
  *       for this endpoint only.</li>
  *   <li>{@link #allowedContentTypes()} overrides {@code uniphore.validation.content-type.allowed-types}
  *       for this endpoint when non-empty; falls through to the global list when empty.</li>
- *   <li>Global {@code custom-headers.required} and {@code custom-headers.not-blank-if-present}
- *       from properties still apply alongside the annotation rules.</li>
  * </ul>
  */
 @Documented
@@ -41,18 +44,8 @@ import java.lang.annotation.Target;
 @Target({ElementType.METHOD, ElementType.TYPE})
 public @interface HeaderConstraints {
 
-    /**
-     * Header names that must be present and non-blank on the request.
-     * Failures return {@code 400 Bad Request}.
-     */
-    String[] required() default {};
-
-    /**
-     * Header names that, when present, must not be blank.
-     * Null / absent values are allowed; empty or whitespace values are rejected.
-     * Failures return {@code 400 Bad Request}.
-     */
-    String[] notBlankIfPresent() default {};
+    /** Inline per-header validation rules. */
+    HeaderRule[] value() default {};
 
     /**
      * When {@code true}, skips the Authorization header check for this endpoint,

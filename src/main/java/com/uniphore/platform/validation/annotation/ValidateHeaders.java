@@ -10,7 +10,10 @@ import java.lang.annotation.Target;
  * Container annotation for repeatable {@link ValidateHeader}.
  * Not typically used directly — the compiler generates this when multiple
  * {@code @ValidateHeader} annotations appear on the same element.
+ *
+ * @deprecated Use {@link HeaderConstraints} with inline {@link HeaderRule} entries instead.
  */
+@Deprecated
 @Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target({ElementType.METHOD, ElementType.TYPE})

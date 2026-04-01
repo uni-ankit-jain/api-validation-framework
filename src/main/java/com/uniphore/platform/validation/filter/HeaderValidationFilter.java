@@ -1,6 +1,7 @@
 package com.uniphore.platform.validation.filter;
 
 import com.uniphore.platform.validation.annotation.HeaderConstraints;
+import com.uniphore.platform.validation.annotation.HeaderRule;
 import com.uniphore.platform.validation.annotation.SkipValidation;
 import com.uniphore.platform.validation.annotation.ValidateHeader;
 import com.uniphore.platform.validation.annotation.ValidateHeaders;
@@ -113,24 +114,21 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             }
         }
 
-        // Step 5c — @HeaderConstraints required and notBlankIfPresent headers
+        // Step 5c — inline @HeaderRule entries from @HeaderConstraints
         if (headerConstraints != null) {
-            for (String headerName : headerConstraints.required()) {
-                String value = request.getHeader(headerName);
-                if (value == null || value.isBlank()) {
-                    throw new HeaderValidationException(
-                            "Required header '" + headerName + "' is missing or blank",
-                            HttpStatus.BAD_REQUEST,
-                            headerName);
+            for (HeaderRule rule : headerConstraints.value()) {
+                String value = request.getHeader(rule.name());
+                if (rule.required() && (value == null || value.isBlank())) {
+                    String msg = rule.message().isBlank()
+                            ? "Required header '" + rule.name() + "' is missing or blank"
+                            : rule.message();
+                    throw new HeaderValidationException(msg, HttpStatus.BAD_REQUEST, rule.name());
                 }
-            }
-            for (String headerName : headerConstraints.notBlankIfPresent()) {
-                String value = request.getHeader(headerName);
-                if (value != null && value.isBlank()) {
-                    throw new HeaderValidationException(
-                            "Header '" + headerName + "' must not be blank when present",
-                            HttpStatus.BAD_REQUEST,
-                            headerName);
+                if (value != null && rule.notBlank() && value.isBlank()) {
+                    String msg = rule.message().isBlank()
+                            ? "Header '" + rule.name() + "' must not be blank when present"
+                            : rule.message();
+                    throw new HeaderValidationException(msg, HttpStatus.BAD_REQUEST, rule.name());
                 }
             }
         }

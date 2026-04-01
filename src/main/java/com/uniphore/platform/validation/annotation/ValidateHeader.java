@@ -11,7 +11,11 @@ import java.lang.annotation.Target;
  * Declares a required (or conditionally required) HTTP header for a controller method or class.
  * When placed on a class, applies to all handler methods within it unless overridden.
  * Repeatable — multiple headers can be declared on the same element.
+ *
+ * @deprecated Use {@link HeaderConstraints} with inline {@link HeaderRule} entries instead.
+ *             {@code @ValidateHeader} remains supported for backward compatibility.
  */
+@Deprecated
 @Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target({ElementType.METHOD, ElementType.TYPE})

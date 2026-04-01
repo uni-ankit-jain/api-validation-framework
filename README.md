@@ -23,8 +23,8 @@ with zero boilerplate integration.
 **What it adds via opt-in configuration:**
 
 - Per-service required custom headers (e.g. `X-Tenant-ID`)
-- Per-endpoint consolidated header rules via `@HeaderConstraints` (required, notBlankIfPresent, skipAuth, allowedContentTypes)
-- Per-endpoint header overrides via `@ValidateHeader`
+- Per-endpoint consolidated header rules via `@HeaderConstraints` + inline `@HeaderRule` entries
+- Per-endpoint header overrides via `@ValidateHeader` *(deprecated — use `@HeaderConstraints`)*
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
 - Per-endpoint field allowed-value rules via `@FieldConstraints` / `@FieldRule`
@@ -221,19 +221,25 @@ Responses when validation fails use HTTP **422 Unprocessable Entity**.
 
 ---
 
-### `@HeaderConstraints`
+### `@HeaderConstraints` / `@HeaderRule`
 
-Consolidates all header validation rules for a controller method or class into a single annotation.
-Replaces the need to stack multiple `@ValidateHeader` annotations and scatter related settings
-across `application.properties`. When placed on a class, applies to every handler method within it.
-A method-level annotation takes full precedence over a class-level one.
+Consolidates all HTTP header validation rules into a single annotation using inline `@HeaderRule`
+elements — the same pattern as `@FieldConstraints` / `@FieldRule`. Replaces stacked `@ValidateHeader`
+annotations and scattered `application.properties` entries. When placed on a class, applies to every
+handler method within it. A method-level annotation takes full precedence over a class-level one.
 
 ```java
 public @interface HeaderConstraints {
-    String[] required()            default {};     // must be present and non-blank
-    String[] notBlankIfPresent()   default {};     // must be non-blank when present
-    boolean  skipAuth()            default false;  // skip Authorization check for this endpoint
-    String[] allowedContentTypes() default {};     // override global allowed Content-Type list
+    HeaderRule[] value()           default {};  // inline per-header rules
+    boolean      skipAuth()        default false;  // skip Authorization check for this endpoint
+    String[]     allowedContentTypes() default {}; // override global Content-Type list
+}
+
+public @interface HeaderRule {
+    String  name();                  // header name, e.g. "X-Tenant-ID"
+    boolean required() default true; // must be present and non-blank
+    boolean notBlank() default true; // must be non-blank when present (applies when required=false too)
+    String  message()  default "";   // custom error message (auto-generated if blank)
 }
 ```
 
@@ -246,10 +252,13 @@ public @interface HeaderConstraints {
 @ValidateHeader(name = "X-Correlation-ID", required = true)
 @ValidateHeader(name = "X-Source", notBlank = false)
 
-// After: single annotation
+// After: single annotation with inline rules
 @HeaderConstraints(
-    required            = {"X-Tenant-ID", "X-Correlation-ID"},
-    notBlankIfPresent   = {"X-Source"},
+    value = {
+        @HeaderRule(name = "X-Tenant-ID"),
+        @HeaderRule(name = "X-Correlation-ID"),
+        @HeaderRule(name = "X-Source", required = false)  // present → non-blank; absent → OK
+    },
     allowedContentTypes = {"application/json", "application/xml"}
 )
 @PostMapping("/orders")
@@ -270,7 +279,7 @@ public ResponseEntity<Void> handleWebhook(@RequestBody String payload) { ... }
 @RestController
 @RequestMapping("/api/reports")
 @HeaderConstraints(
-    required            = {"X-Tenant-ID"},
+    value               = { @HeaderRule(name = "X-Tenant-ID") },
     allowedContentTypes = {"application/json"}
 )
 public class ReportController {
@@ -282,7 +291,10 @@ public class ReportController {
     // Method-level wins — also accepts XML and requires an extra header
     @GetMapping("/export")
     @HeaderConstraints(
-        required            = {"X-Tenant-ID", "X-Export-Format"},
+        value = {
+            @HeaderRule(name = "X-Tenant-ID"),
+            @HeaderRule(name = "X-Export-Format", message = "Specify export format: csv or pdf")
+        },
         allowedContentTypes = {"application/json", "application/xml"}
     )
     public ResponseEntity<byte[]> export() { ... }
@@ -293,13 +305,13 @@ public class ReportController {
 
 | `@HeaderConstraints` attribute | Interaction |
 |---|---|
-| `required` | Applied in addition to `custom-headers.required` from properties |
-| `notBlankIfPresent` | Applied in addition to `custom-headers.not-blank-if-present` from properties |
+| `@HeaderRule` entries | Applied in addition to globally configured `custom-headers.*` from properties |
 | `skipAuth = true` | Skips Authorization check even if `authorization-header.required=true` globally |
 | `allowedContentTypes` non-empty | Replaces `content-type.allowed-types` for this endpoint only |
 | `allowedContentTypes` empty (default) | Falls through to the global `content-type.allowed-types` list |
 
-> `@ValidateHeader` remains fully supported for backward compatibility and can coexist with `@HeaderConstraints`.
+> **`@ValidateHeader` is deprecated** in favour of `@HeaderConstraints` + `@HeaderRule`.
+> It remains fully supported for backward compatibility but will be removed in a future version.
 
 ---
 
@@ -622,8 +634,9 @@ api-validation-framework/
     │   ├── java/com/uniphore/platform/validation/
     │   │   ├── annotation/
     │   │   │   ├── HeaderConstraints.java      # Consolidated per-endpoint header rules
-    │   │   │   ├── ValidateHeader.java         # Repeatable per-endpoint header requirement
-    │   │   │   ├── ValidateHeaders.java        # Container annotation (compiler-generated)
+    │   │   │   ├── HeaderRule.java             # Single header rule (inline inside @HeaderConstraints)
+    │   │   │   ├── ValidateHeader.java         # (deprecated) Repeatable per-endpoint header requirement
+    │   │   │   ├── ValidateHeaders.java        # (deprecated) Container for @ValidateHeader
     │   │   │   ├── SkipValidation.java         # Opt-out on a specific endpoint
     │   │   │   ├── FieldConstraints.java       # Per-endpoint field allowed-value rules
     │   │   │   └── FieldRule.java              # Single field → allowed values declaration
