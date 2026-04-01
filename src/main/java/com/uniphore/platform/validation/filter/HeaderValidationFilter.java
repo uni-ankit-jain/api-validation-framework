@@ -1,5 +1,6 @@
 package com.uniphore.platform.validation.filter;
 
+import com.uniphore.platform.validation.annotation.HeaderConstraints;
 import com.uniphore.platform.validation.annotation.SkipValidation;
 import com.uniphore.platform.validation.annotation.ValidateHeader;
 import com.uniphore.platform.validation.annotation.ValidateHeaders;
@@ -70,18 +71,27 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             return;
         }
 
-        // Step 3 — validate Authorization header
-        if (properties.getAuthorizationHeader().isRequired()) {
+        // Resolve @HeaderConstraints once — method-level wins over class-level
+        HeaderConstraints headerConstraints = resolveHeaderConstraints(handlerMethod);
+
+        // Step 3 — validate Authorization header (skipped if @HeaderConstraints(skipAuth=true))
+        boolean skipAuth = headerConstraints != null && headerConstraints.skipAuth();
+        if (!skipAuth && properties.getAuthorizationHeader().isRequired()) {
             validateAuthorizationHeader(request);
         }
 
         // Step 4 — validate Content-Type on mutating requests
+        // @HeaderConstraints.allowedContentTypes overrides the global list when non-empty
         if (properties.getContentType().isValidateOnMutating()
                 && MUTATING_METHODS.contains(request.getMethod().toUpperCase())) {
-            validateContentType(request);
+            List<String> effectiveContentTypes =
+                    (headerConstraints != null && headerConstraints.allowedContentTypes().length > 0)
+                            ? Arrays.asList(headerConstraints.allowedContentTypes())
+                            : properties.getContentType().getAllowedTypes();
+            validateContentType(request, effectiveContentTypes);
         }
 
-        // Step 5 — validate globally required custom headers
+        // Step 5 — validate globally required custom headers (from properties)
         for (String headerName : properties.getCustomHeaders().getRequired()) {
             String value = request.getHeader(headerName);
             if (value == null || value.isBlank()) {
@@ -92,7 +102,7 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             }
         }
 
-        // Step 5b — validate not-blank-if-present custom headers
+        // Step 5b — validate not-blank-if-present custom headers (from properties)
         for (String headerName : properties.getCustomHeaders().getNotBlankIfPresent()) {
             String value = request.getHeader(headerName);
             if (value != null && value.isBlank()) {
@@ -103,7 +113,29 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
             }
         }
 
-        // Step 6 — per-endpoint @ValidateHeader annotations
+        // Step 5c — @HeaderConstraints required and notBlankIfPresent headers
+        if (headerConstraints != null) {
+            for (String headerName : headerConstraints.required()) {
+                String value = request.getHeader(headerName);
+                if (value == null || value.isBlank()) {
+                    throw new HeaderValidationException(
+                            "Required header '" + headerName + "' is missing or blank",
+                            HttpStatus.BAD_REQUEST,
+                            headerName);
+                }
+            }
+            for (String headerName : headerConstraints.notBlankIfPresent()) {
+                String value = request.getHeader(headerName);
+                if (value != null && value.isBlank()) {
+                    throw new HeaderValidationException(
+                            "Header '" + headerName + "' must not be blank when present",
+                            HttpStatus.BAD_REQUEST,
+                            headerName);
+                }
+            }
+        }
+
+        // Step 6 — per-endpoint @ValidateHeader annotations (backward compatible)
         if (handlerMethod != null) {
             validatePerEndpointHeaders(request, handlerMethod);
         }
@@ -158,7 +190,7 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
         }
     }
 
-    private void validateContentType(HttpServletRequest request) {
+    private void validateContentType(HttpServletRequest request, List<String> allowed) {
         String contentType = request.getContentType();
         if (contentType == null || contentType.isBlank()) {
             throw new HeaderValidationException(
@@ -167,7 +199,6 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
                     "Content-Type");
         }
         // Prefix match — allows "application/json; charset=UTF-8"
-        List<String> allowed = properties.getContentType().getAllowedTypes();
         boolean matched = allowed.stream()
                 .anyMatch(type -> contentType.toLowerCase().startsWith(type.toLowerCase()));
         if (!matched) {
@@ -176,6 +207,21 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
                     HttpStatus.BAD_REQUEST,
                     "Content-Type");
         }
+    }
+
+    /**
+     * Returns the effective {@link HeaderConstraints} for the given handler method.
+     * Method-level annotation takes full precedence over class-level.
+     */
+    private HeaderConstraints resolveHeaderConstraints(HandlerMethod handlerMethod) {
+        if (handlerMethod == null) {
+            return null;
+        }
+        HeaderConstraints methodLevel = handlerMethod.getMethodAnnotation(HeaderConstraints.class);
+        if (methodLevel != null) {
+            return methodLevel;
+        }
+        return handlerMethod.getBeanType().getAnnotation(HeaderConstraints.class);
     }
 
     private void validatePerEndpointHeaders(HttpServletRequest request, HandlerMethod handlerMethod) {

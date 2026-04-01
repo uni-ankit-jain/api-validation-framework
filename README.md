@@ -23,6 +23,7 @@ with zero boilerplate integration.
 **What it adds via opt-in configuration:**
 
 - Per-service required custom headers (e.g. `X-Tenant-ID`)
+- Per-endpoint consolidated header rules via `@HeaderConstraints` (required, notBlankIfPresent, skipAuth, allowedContentTypes)
 - Per-endpoint header overrides via `@ValidateHeader`
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
@@ -217,6 +218,88 @@ public class ReportController {
 ```
 
 Responses when validation fails use HTTP **422 Unprocessable Entity**.
+
+---
+
+### `@HeaderConstraints`
+
+Consolidates all header validation rules for a controller method or class into a single annotation.
+Replaces the need to stack multiple `@ValidateHeader` annotations and scatter related settings
+across `application.properties`. When placed on a class, applies to every handler method within it.
+A method-level annotation takes full precedence over a class-level one.
+
+```java
+public @interface HeaderConstraints {
+    String[] required()            default {};     // must be present and non-blank
+    String[] notBlankIfPresent()   default {};     // must be non-blank when present
+    boolean  skipAuth()            default false;  // skip Authorization check for this endpoint
+    String[] allowedContentTypes() default {};     // override global allowed Content-Type list
+}
+```
+
+**Example — consolidate all rules in one place:**
+
+```java
+// Before: scattered across properties + stacked annotations
+// uniphore.validation.custom-headers.required=X-Tenant-ID
+// uniphore.validation.content-type.allowed-types=application/json,application/xml
+@ValidateHeader(name = "X-Correlation-ID", required = true)
+@ValidateHeader(name = "X-Source", notBlank = false)
+
+// After: single annotation
+@HeaderConstraints(
+    required            = {"X-Tenant-ID", "X-Correlation-ID"},
+    notBlankIfPresent   = {"X-Source"},
+    allowedContentTypes = {"application/json", "application/xml"}
+)
+@PostMapping("/orders")
+public ResponseEntity<OrderResponse> createOrder(@RequestBody @Valid OrderRequest req) { ... }
+```
+
+**Example — public endpoint that skips Authorization:**
+
+```java
+@HeaderConstraints(skipAuth = true)
+@PostMapping("/webhooks/inbound")
+public ResponseEntity<Void> handleWebhook(@RequestBody String payload) { ... }
+```
+
+**Example — class-level default with a method-level override:**
+
+```java
+@RestController
+@RequestMapping("/api/reports")
+@HeaderConstraints(
+    required            = {"X-Tenant-ID"},
+    allowedContentTypes = {"application/json"}
+)
+public class ReportController {
+
+    // Inherits class-level rules
+    @GetMapping
+    public List<Report> list() { ... }
+
+    // Method-level wins — also accepts XML and requires an extra header
+    @GetMapping("/export")
+    @HeaderConstraints(
+        required            = {"X-Tenant-ID", "X-Export-Format"},
+        allowedContentTypes = {"application/json", "application/xml"}
+    )
+    public ResponseEntity<byte[]> export() { ... }
+}
+```
+
+**Interaction with global properties:**
+
+| `@HeaderConstraints` attribute | Interaction |
+|---|---|
+| `required` | Applied in addition to `custom-headers.required` from properties |
+| `notBlankIfPresent` | Applied in addition to `custom-headers.not-blank-if-present` from properties |
+| `skipAuth = true` | Skips Authorization check even if `authorization-header.required=true` globally |
+| `allowedContentTypes` non-empty | Replaces `content-type.allowed-types` for this endpoint only |
+| `allowedContentTypes` empty (default) | Falls through to the global `content-type.allowed-types` list |
+
+> `@ValidateHeader` remains fully supported for backward compatibility and can coexist with `@HeaderConstraints`.
 
 ---
 
@@ -538,6 +621,7 @@ api-validation-framework/
     ├── main/
     │   ├── java/com/uniphore/platform/validation/
     │   │   ├── annotation/
+    │   │   │   ├── HeaderConstraints.java      # Consolidated per-endpoint header rules
     │   │   │   ├── ValidateHeader.java         # Repeatable per-endpoint header requirement
     │   │   │   ├── ValidateHeaders.java        # Container annotation (compiler-generated)
     │   │   │   ├── SkipValidation.java         # Opt-out on a specific endpoint
