@@ -26,6 +26,7 @@ with zero boilerplate integration.
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
 - Per-endpoint field allowed-value rules via `@FieldConstraints` / `@FieldRule`
+- Per-endpoint field length rules via `@FieldLengthConstraints` / `@LengthRule`
 
 ---
 
@@ -407,6 +408,98 @@ public class ContentController {
 
 ---
 
+### `@FieldLengthConstraints` / `@LengthRule`
+
+Declares field length constraints for a controller method or class using inline `@LengthRule`
+entries — the same pattern as `@FieldConstraints` / `@FieldRule`. Rules are enforced against the
+`@RequestBody` argument before the method executes. Can be combined with `@FieldConstraints` on
+the same method; all violations from both annotations are collected and reported together.
+
+```java
+public @interface FieldLengthConstraints {
+    LengthRule[] value() default {};
+}
+
+public @interface LengthRule {
+    String field();                          // field name in the request body object
+    int    min()     default 0;              // minimum length (inclusive), default no minimum
+    int    max()     default Integer.MAX_VALUE; // maximum length (inclusive), default no maximum
+    String message() default "";             // custom error message (auto-generated if blank)
+}
+```
+
+Supported field types:
+
+| Field type | Measured as |
+|---|---|
+| `String` | Character count |
+| `Collection` | Element count |
+| Other | Warning logged, rule skipped |
+
+**Example — string and collection length rules:**
+
+```java
+@FieldLengthConstraints({
+    @LengthRule(field = "name",        min = 2,  max = 100),
+    @LengthRule(field = "description", max = 500),
+    @LengthRule(field = "tags",        max = 10, message = "No more than 10 tags allowed")
+})
+@PostMapping("/products")
+public ResponseEntity<Product> create(@RequestBody @Valid ProductRequest req) { ... }
+```
+
+**Example — combined with `@FieldConstraints` on the same method:**
+
+```java
+@FieldConstraints({
+    @FieldRule(field = "status", values = {"ACTIVE", "INACTIVE"})
+})
+@FieldLengthConstraints({
+    @LengthRule(field = "name", min = 2, max = 100),
+    @LengthRule(field = "description", max = 500)
+})
+@PostMapping("/products")
+public ResponseEntity<Product> create(@RequestBody @Valid ProductRequest req) { ... }
+```
+
+**Example — class-level default with method-level override:**
+
+```java
+@RestController
+@FieldLengthConstraints({
+    @LengthRule(field = "title", min = 1, max = 200)
+})
+public class ArticleController {
+
+    // Inherits class-level rule
+    @PostMapping("/articles")
+    public ResponseEntity<Article> create(@RequestBody @Valid ArticleRequest req) { ... }
+
+    // Method-level wins — title can be longer on this endpoint
+    @PutMapping("/articles/{id}")
+    @FieldLengthConstraints({
+        @LengthRule(field = "title", min = 1, max = 500)
+    })
+    public ResponseEntity<Article> update(@PathVariable String id,
+                                          @RequestBody @Valid ArticleRequest req) { ... }
+}
+```
+
+**Behaviour:**
+
+| Scenario | Result |
+|---|---|
+| Length within `[min, max]` | Passes |
+| Length outside `[min, max]` | Fails — `400 Bad Request` with field-level error |
+| Field value is `null` | Passes — pair with `@NotNull` on the DTO to reject null |
+| Field name not found on DTO | Warning logged, rule skipped silently |
+| Multiple fields fail | All violations reported at once (not fail-fast) |
+| Only `max` set | `"Field 'x' must not exceed N characters (actual: M)"` |
+| Only `min` set | `"Field 'x' must be at least N characters (actual: M)"` |
+| Both `min` and `max` set | `"Field 'x' length must be between N and M (actual: K)"` |
+
+---
+
 ## Error Response Format
 
 All validation failures return a consistent JSON envelope:
@@ -549,7 +642,9 @@ api-validation-framework/
     │   │   │   ├── HeaderRule.java             # Inline header rule (name, required, notBlank, message)
     │   │   │   ├── SkipValidation.java         # Opt-out all validation on a specific endpoint
     │   │   │   ├── FieldConstraints.java       # Per-endpoint field allowed-value rules container
-    │   │   │   └── FieldRule.java              # Inline field rule (field, values, ignoreCase, message)
+    │   │   │   ├── FieldRule.java              # Inline field rule (field, values, ignoreCase, message)
+    │   │   │   ├── FieldLengthConstraints.java # Per-endpoint field length rules container
+    │   │   │   └── LengthRule.java             # Inline length rule (field, min, max, message)
     │   │   ├── aspect/
     │   │   │   └── FieldConstraintsAspect.java # AOP aspect enforcing @FieldConstraints rules
     │   │   ├── autoconfigure/

@@ -1,7 +1,9 @@
 package com.uniphore.platform.validation.aspect;
 
 import com.uniphore.platform.validation.annotation.FieldConstraints;
+import com.uniphore.platform.validation.annotation.FieldLengthConstraints;
 import com.uniphore.platform.validation.annotation.FieldRule;
+import com.uniphore.platform.validation.annotation.LengthRule;
 import com.uniphore.platform.validation.exception.BodyValidationException;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -16,6 +18,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,13 +26,16 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * AOP aspect that enforces {@link FieldConstraints} rules declared on controller methods.
+ * AOP aspect that enforces {@link FieldConstraints} and {@link FieldLengthConstraints} rules
+ * declared on controller methods. Both annotation types are evaluated in a single intercept so
+ * a method carrying both annotations executes exactly once.
  *
  * <p>Execution order:
  * <ol>
  *   <li>Locate the {@code @RequestBody} argument in the join point.</li>
- *   <li>For each {@link FieldRule}, read the field value via reflection.</li>
- *   <li>Null values are skipped (pair with {@code @NotNull} on the DTO if needed).</li>
+ *   <li>Validate allowed-value rules from {@link FieldConstraints} (if present).</li>
+ *   <li>Validate length rules from {@link FieldLengthConstraints} (if present).</li>
+ *   <li>Null field values are always skipped — pair with {@code @NotNull} on the DTO if needed.</li>
  *   <li>All violations are collected before throwing, so the response reports every invalid field at once.</li>
  * </ol>
  */
@@ -39,19 +45,16 @@ public class FieldConstraintsAspect {
     private static final Logger log = LoggerFactory.getLogger(FieldConstraintsAspect.class);
 
     /**
-     * Intercepts methods annotated with {@link FieldConstraints} and validates
-     * the {@code @RequestBody} argument against the declared rules.
-     * Method-level annotation takes precedence over class-level.
+     * Intercepts methods where either {@link FieldConstraints} or {@link FieldLengthConstraints}
+     * is present (on the method or the declaring class) and validates the {@code @RequestBody}
+     * argument against the declared rules.
      */
     @Around("(@annotation(com.uniphore.platform.validation.annotation.FieldConstraints) " +
-            "|| @within(com.uniphore.platform.validation.annotation.FieldConstraints)) " +
+            "|| @within(com.uniphore.platform.validation.annotation.FieldConstraints) " +
+            "|| @annotation(com.uniphore.platform.validation.annotation.FieldLengthConstraints) " +
+            "|| @within(com.uniphore.platform.validation.annotation.FieldLengthConstraints)) " +
             "&& execution(* *(..))")
     public Object validate(ProceedingJoinPoint pjp) throws Throwable {
-        FieldConstraints constraints = resolveAnnotation(pjp);
-        if (constraints == null) {
-            return pjp.proceed();
-        }
-
         Object requestBody = findRequestBody(pjp);
         if (requestBody == null) {
             return pjp.proceed();
@@ -59,12 +62,34 @@ public class FieldConstraintsAspect {
 
         Map<String, List<String>> errors = new LinkedHashMap<>();
 
+        FieldConstraints fieldConstraints = resolveFieldConstraints(pjp);
+        if (fieldConstraints != null) {
+            validateAllowedValues(requestBody, fieldConstraints, errors);
+        }
+
+        FieldLengthConstraints lengthConstraints = resolveFieldLengthConstraints(pjp);
+        if (lengthConstraints != null) {
+            validateLengths(requestBody, lengthConstraints, errors);
+        }
+
+        if (!errors.isEmpty()) {
+            throw new BodyValidationException("Field validation failed", errors);
+        }
+
+        return pjp.proceed();
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation logic
+    // -------------------------------------------------------------------------
+
+    private void validateAllowedValues(Object requestBody, FieldConstraints constraints,
+                                       Map<String, List<String>> errors) {
         for (FieldRule rule : constraints.value()) {
             Object value = readField(requestBody, rule.field());
             if (value == null) {
-                continue;  // null is valid — use @NotNull on the DTO field to reject it
+                continue;
             }
-
             String actual = value.toString();
             Set<String> allowed = buildAllowedSet(rule);
             String toCheck = rule.ignoreCase() ? actual.toLowerCase() : actual;
@@ -76,22 +101,36 @@ public class FieldConstraintsAspect {
                 errors.computeIfAbsent(rule.field(), k -> new ArrayList<>()).add(msg);
             }
         }
+    }
 
-        if (!errors.isEmpty()) {
-            throw new BodyValidationException("Field value validation failed", errors);
+    private void validateLengths(Object requestBody, FieldLengthConstraints constraints,
+                                  Map<String, List<String>> errors) {
+        for (LengthRule rule : constraints.value()) {
+            Object value = readField(requestBody, rule.field());
+            if (value == null) {
+                continue;
+            }
+
+            int actual = measureLength(value, rule.field());
+            if (actual < 0) {
+                continue;  // unsupported type — already warned in measureLength
+            }
+
+            if (actual < rule.min() || actual > rule.max()) {
+                String msg = rule.message().isEmpty()
+                        ? buildLengthMessage(rule.field(), rule.min(), rule.max(), actual)
+                        : rule.message();
+                errors.computeIfAbsent(rule.field(), k -> new ArrayList<>()).add(msg);
+            }
         }
-
-        return pjp.proceed();
     }
 
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
-    /**
-     * Method-level annotation wins over class-level when both exist.
-     */
-    private FieldConstraints resolveAnnotation(ProceedingJoinPoint pjp) {
+    /** Method-level annotation wins over class-level. */
+    private FieldConstraints resolveFieldConstraints(ProceedingJoinPoint pjp) {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         FieldConstraints methodLevel = method.getAnnotation(FieldConstraints.class);
         if (methodLevel != null) {
@@ -100,9 +139,17 @@ public class FieldConstraintsAspect {
         return pjp.getTarget().getClass().getAnnotation(FieldConstraints.class);
     }
 
-    /**
-     * Returns the first argument annotated with {@code @RequestBody}, or {@code null}.
-     */
+    /** Method-level annotation wins over class-level. */
+    private FieldLengthConstraints resolveFieldLengthConstraints(ProceedingJoinPoint pjp) {
+        Method method = ((MethodSignature) pjp.getSignature()).getMethod();
+        FieldLengthConstraints methodLevel = method.getAnnotation(FieldLengthConstraints.class);
+        if (methodLevel != null) {
+            return methodLevel;
+        }
+        return pjp.getTarget().getClass().getAnnotation(FieldLengthConstraints.class);
+    }
+
+    /** Returns the first argument annotated with {@code @RequestBody}, or {@code null}. */
     private Object findRequestBody(ProceedingJoinPoint pjp) {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         Annotation[][] paramAnnotations = method.getParameterAnnotations();
@@ -119,9 +166,8 @@ public class FieldConstraintsAspect {
     }
 
     /**
-     * Reads a declared field value from the target object via reflection.
-     * Searches the declared class and its superclasses.
-     * Returns {@code null} if the field doesn't exist or isn't accessible.
+     * Reads a declared field value via reflection, walking the class hierarchy.
+     * Returns {@code null} if the field is not found or not accessible.
      */
     private Object readField(Object target, String fieldName) {
         Class<?> clazz = target.getClass();
@@ -133,13 +179,47 @@ public class FieldConstraintsAspect {
             } catch (NoSuchFieldException e) {
                 clazz = clazz.getSuperclass();
             } catch (IllegalAccessException e) {
-                log.warn("Cannot access field '{}' on {}: {}", fieldName, target.getClass().getSimpleName(), e.getMessage());
+                log.warn("Cannot access field '{}' on {}: {}",
+                        fieldName, target.getClass().getSimpleName(), e.getMessage());
                 return null;
             }
         }
-        log.warn("@FieldRule references unknown field '{}' on {}. Rule will be skipped.",
+        log.warn("Field '{}' not found on {}. Rule will be skipped.",
                 fieldName, target.getClass().getSimpleName());
         return null;
+    }
+
+    /**
+     * Returns the measurable length of a value:
+     * <ul>
+     *   <li>{@code String} → character count</li>
+     *   <li>{@code Collection} → element count</li>
+     * </ul>
+     * Returns {@code -1} for unsupported types (warning logged).
+     */
+    private int measureLength(Object value, String fieldName) {
+        if (value instanceof String s) {
+            return s.length();
+        }
+        if (value instanceof Collection<?> c) {
+            return c.size();
+        }
+        log.warn("@LengthRule on field '{}' — unsupported type {}. Rule will be skipped.",
+                fieldName, value.getClass().getSimpleName());
+        return -1;
+    }
+
+    private String buildLengthMessage(String field, int min, int max, int actual) {
+        if (min > 0 && max < Integer.MAX_VALUE) {
+            return "Field '" + field + "' length must be between " + min + " and " + max
+                    + " (actual: " + actual + ")";
+        }
+        if (max < Integer.MAX_VALUE) {
+            return "Field '" + field + "' must not exceed " + max
+                    + " characters (actual: " + actual + ")";
+        }
+        return "Field '" + field + "' must be at least " + min
+                + " characters (actual: " + actual + ")";
     }
 
     private Set<String> buildAllowedSet(FieldRule rule) {
