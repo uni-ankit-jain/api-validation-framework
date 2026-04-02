@@ -26,6 +26,7 @@ with zero boilerplate integration.
 - Endpoint opt-out via `@SkipValidation`
 - Custom string safety constraints via `@SafeString` and `@NotBlankIfPresent`
 - Per-endpoint field allowed-value and length rules via `@FieldConstraints` / `@FieldRule`
+- Protobuf message body validation — the same `@FieldConstraints` / `@FieldRule` annotations work transparently on `com.google.protobuf.Message` request bodies when `protobuf-java` is on the classpath
 
 ---
 
@@ -143,7 +144,7 @@ All properties are under the `uniphore.validation` prefix.
 | `authorization-header.required` | `boolean` | `true` | Require the `Authorization` header on every non-bypassed request |
 | `authorization-header.require-bearer-prefix` | `boolean` | `true` | Enforce `Bearer <token>` format; also validates the token is non-empty |
 | `content-type.validate-on-mutating` | `boolean` | `true` | Validate `Content-Type` on `POST`, `PUT`, and `PATCH` requests |
-| `content-type.allowed-types` | `List<String>` | `[application/json]` | Prefix-matched allowed Content-Type values (e.g. `application/json; charset=UTF-8` matches `application/json`) |
+| `content-type.allowed-types` | `List<String>` | `[application/json]` | Prefix-matched allowed Content-Type values (e.g. `application/json; charset=UTF-8` matches `application/json`). Add `application/x-protobuf` here when accepting protobuf request bodies. |
 | `custom-headers.required` | `List<String>` | `[]` | Header names that must be present and non-blank on every non-bypassed request |
 | `custom-headers.not-blank-if-present` | `List<String>` | `[]` | Header names that, when present, must not be blank |
 | `bypass-paths` | `List<String>` | `[/health/**, /swagger-ui/**, /v3/api-docs/**]` | Ant-style path patterns that skip all validation |
@@ -423,6 +424,198 @@ public class ContentController {
 
 ---
 
+## Protobuf Request Body Validation
+
+The same `@FieldConstraints` / `@FieldRule` annotations work transparently on
+`com.google.protobuf.Message` request bodies. When the aspect detects that the incoming
+`@RequestBody` argument is a protobuf `Message`, it switches from reflection to the
+protobuf Descriptors API — no annotation changes required.
+
+### Prerequisites
+
+**1. Add `protobuf-java` to your service:**
+
+```groovy
+// build.gradle
+dependencies {
+    implementation 'com.google.protobuf:protobuf-java:3.25.5'
+}
+```
+
+Spring Boot auto-configures `ProtobufHttpMessageConverter` when `protobuf-java` is on the
+classpath, so no additional Spring beans are needed.
+
+**2. Allow `application/x-protobuf` as a Content-Type:**
+
+```properties
+# application.properties
+uniphore.validation.content-type.allowed-types=application/json,application/x-protobuf
+```
+
+### Field Name Convention
+
+Use the field name exactly as it appears in the `.proto` file (snake_case). This is different
+from the camelCase getter name that protobuf generates in Java.
+
+```protobuf
+// order.proto
+message OrderRequest {
+  string order_id  = 1;   // ← use "order_id" in @FieldRule, not "orderId"
+  string status    = 2;
+  Priority priority = 3;
+}
+```
+
+### Supported Field Types
+
+| Proto type | What `@FieldRule` receives | Notes |
+|---|---|---|
+| `string` | `String` | Character count for `min`/`max` |
+| Numeric scalars (`int32`, `int64`, `float`, `double`, `bool`, …) | Boxed Java type (`Integer`, `Long`, …) | Comparable via `values` as strings |
+| `enum` | `String` — the enum constant **name** (e.g. `"ACTIVE"`) | Case-insensitive comparison works via `ignoreCase = true` |
+| `message` (nested) | The nested `Message` object | Use dot-notation to reach a child field (e.g. `"address.city"`) |
+| `repeated T` | `List<T>` | Element count for `min`/`max` |
+| `bytes` | `ByteString` | Byte count for `min`/`max` |
+
+### Null / Unset Field Semantics
+
+| Field type | Unset behaviour |
+|---|---|
+| Proto3 message field (not set) | Returns `null` — validation rule is skipped |
+| Proto3 `optional` scalar (not set) | Returns `null` — validation rule is skipped |
+| Proto3 regular scalar (not set) | Returns the proto3 default (`""`, `0`, `false`) — rule runs against the default |
+| Proto2 field (not set) | Returns `null` — validation rule is skipped |
+
+For regular proto3 scalars you cannot distinguish "not provided" from "set to the default value".
+If you need to enforce a non-empty string, use `min = 1`; for a required integer, add a JSR-303
+`@NotNull` on the DTO or use `values` to reject `"0"`.
+
+### Usage Example
+
+**Proto definition (`order.proto`):**
+
+```protobuf
+syntax = "proto3";
+package com.example.orders;
+
+option java_package = "com.example.orders.proto";
+option java_outer_classname = "OrderProto";
+
+enum Priority {
+  PRIORITY_UNKNOWN = 0;
+  LOW              = 1;
+  MEDIUM           = 2;
+  HIGH             = 3;
+}
+
+message Address {
+  string city        = 1;
+  string country_code = 2;
+}
+
+message OrderRequest {
+  string   order_id  = 1;
+  string   status    = 2;
+  Priority priority  = 3;
+  Address  address   = 4;
+  repeated string tags = 5;
+  bytes    checksum  = 6;
+}
+```
+
+**Controller (`OrderController.java`):**
+
+```java
+import com.example.orders.proto.OrderProto.OrderRequest;
+import com.uniphore.platform.validation.annotation.FieldConstraints;
+import com.uniphore.platform.validation.annotation.FieldRule;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @PostMapping(
+        consumes = "application/x-protobuf",
+        produces = "application/x-protobuf"
+    )
+    @HeaderConstraints({
+        @HeaderRule(name = "X-Tenant-ID"),
+        @HeaderRule(name = "X-Correlation-ID")
+    })
+    @FieldConstraints({
+        // Allowed-values on a string field
+        @FieldRule(field = "status",   values = {"PENDING", "CONFIRMED", "CANCELLED"}),
+
+        // Enum validated by constant name (case-insensitive)
+        @FieldRule(field = "priority", values = {"LOW", "MEDIUM", "HIGH"}, ignoreCase = true),
+
+        // Nested message field via dot-notation
+        @FieldRule(field = "address.city",         values = {"NYC", "LON", "BLR", "SFO"}),
+        @FieldRule(field = "address.country_code", min = 2, max = 2),
+
+        // Repeated field — element count
+        @FieldRule(field = "tags",     max = 10, message = "No more than 10 tags allowed"),
+
+        // Bytes field — byte count
+        @FieldRule(field = "checksum", min = 16, max = 32)
+    })
+    public OrderResponse createOrder(@RequestBody OrderRequest request) {
+        // request body is fully validated before this method runs
+        return orderService.create(request);
+    }
+}
+```
+
+**What happens on a bad request (`priority = PRIORITY_UNKNOWN`, `tags` has 12 elements):**
+
+```json
+{
+  "timestamp": "2026-04-02T10:23:45.123Z",
+  "status": 400,
+  "error": "Bad Request",
+  "message": "Field validation failed",
+  "traceId": "abc-123",
+  "tenantId": "tenant-uuid",
+  "errors": [
+    {
+      "field": "priority",
+      "message": "Value 'PRIORITY_UNKNOWN' is not allowed. Allowed values: [LOW, MEDIUM, HIGH]"
+    },
+    {
+      "field": "tags",
+      "message": "No more than 10 tags allowed"
+    }
+  ]
+}
+```
+
+All violations are collected before throwing — the response reports every invalid field at once.
+
+### Mixing JSON and Protobuf Endpoints
+
+`@FieldConstraints` works identically for both POJO and protobuf request bodies. The aspect
+detects the type at runtime — no annotation changes are needed per content type. A service that
+accepts both formats can apply the same rules:
+
+```java
+// Accepts both application/json and application/x-protobuf
+@PostMapping(consumes = {"application/json", "application/x-protobuf"})
+@FieldConstraints({
+    @FieldRule(field = "status", values = {"ACTIVE", "INACTIVE"})
+})
+public ResponseEntity<Void> handle(@RequestBody OrderRequest request) { ... }
+```
+
+The field name `"status"` resolves via:
+- **POJO path**: reflection over `OrderRequest.status` (camelCase Java field)
+- **Protobuf path**: Descriptors API lookup of `status` (snake_case proto field name)
+
+Ensure both your DTO and your `.proto` file use the same name for shared rules, or declare
+separate endpoints with separate annotations when the names diverge.
+
+---
+
 ## Error Response Format
 
 All validation failures return a consistent JSON envelope:
@@ -567,7 +760,8 @@ api-validation-framework/
     │   │   │   ├── FieldConstraints.java       # Per-endpoint field validation rules container
     │   │   │   └── FieldRule.java              # Inline rule (field, values, ignoreCase, min, max, message)
     │   │   ├── aspect/
-    │   │   │   └── FieldConstraintsAspect.java # AOP aspect enforcing @FieldConstraints rules
+    │   │   │   ├── FieldConstraintsAspect.java # AOP aspect enforcing @FieldConstraints rules
+    │   │   │   └── ProtoFieldReader.java       # Protobuf Descriptors-based field access (loaded only when protobuf-java is present)
     │   │   ├── autoconfigure/
     │   │   │   └── ValidationAutoConfiguration.java  # Spring Boot auto-configuration entry point
     │   │   ├── exception/
@@ -589,6 +783,7 @@ api-validation-framework/
     │       └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
     └── test/
         └── java/com/uniphore/platform/validation/
+            ├── aspect/FieldConstraintsAspectProtoTest.java
             ├── filter/HeaderValidationFilterTest.java
             ├── handler/ValidationExceptionHandlerTest.java
             └── properties/ValidationPropertiesTest.java

@@ -31,11 +31,43 @@ import java.util.stream.Collectors;
  * reports every invalid field at once.
  *
  * <p>Null field values are always skipped — pair with {@code @NotNull} on the DTO if needed.
+ *
+ * <h3>Protobuf support</h3>
+ * <p>When {@code protobuf-java} is on the runtime classpath, request bodies that implement
+ * {@code com.google.protobuf.Message} are validated via the protobuf Descriptors API instead
+ * of reflection.  This means:
+ * <ul>
+ *   <li>Field names must match the proto field name (snake_case as defined in the {@code .proto}
+ *       file).</li>
+ *   <li>Dot-notation paths resolve nested messages (e.g. {@code "address.city"}).</li>
+ *   <li>Enum values are compared by their name string (e.g. {@code "ACTIVE"}).</li>
+ *   <li>Repeated fields support min/max element-count constraints.</li>
+ *   <li>Optional/message fields not yet set are treated as {@code null} (rule skipped).</li>
+ * </ul>
+ * <p>Protobuf-java is declared as an optional dependency; if absent the aspect falls back to
+ * the standard reflection path and works identically for regular POJO request bodies.
  */
 @Aspect
 public class FieldConstraintsAspect {
 
     private static final Logger log = LoggerFactory.getLogger(FieldConstraintsAspect.class);
+
+    /**
+     * {@code true} when {@code com.google.protobuf.Message} is resolvable at runtime.
+     * Guards all references to {@link ProtoFieldReader} so the class is never loaded
+     * (and does not cause {@link NoClassDefFoundError}) when protobuf-java is absent.
+     */
+    private static final boolean PROTOBUF_PRESENT;
+
+    static {
+        boolean present = false;
+        try {
+            Class.forName("com.google.protobuf.Message");
+            present = true;
+        } catch (ClassNotFoundException ignored) {
+        }
+        PROTOBUF_PRESENT = present;
+    }
 
     @Around("(@annotation(com.uniphore.platform.validation.annotation.FieldConstraints) " +
             "|| @within(com.uniphore.platform.validation.annotation.FieldConstraints)) " +
@@ -126,10 +158,23 @@ public class FieldConstraintsAspect {
     }
 
     /**
-     * Reads a declared field value via reflection, walking the class hierarchy.
-     * Returns {@code null} if the field is not found or not accessible.
+     * Reads a field value from a request-body object.
+     *
+     * <p>When {@code protobuf-java} is on the classpath and {@code target} is a
+     * {@code com.google.protobuf.Message}, delegates to {@link ProtoFieldReader} which uses
+     * the Descriptors API and supports dot-notation paths for nested messages.
+     * Otherwise falls back to reflection over the Java class hierarchy.
+     *
+     * @param target    the request-body object
+     * @param fieldName field name (or dot-separated path for protobuf nested messages)
+     * @return field value, or {@code null} if absent / not accessible
      */
     private Object readField(Object target, String fieldName) {
+        if (PROTOBUF_PRESENT && ProtoFieldReader.isProtoMessage(target)) {
+            return ProtoFieldReader.readField(target, fieldName, log);
+        }
+
+        // POJO path: walk the class hierarchy via reflection
         Class<?> clazz = target.getClass();
         while (clazz != null && clazz != Object.class) {
             try {
@@ -151,7 +196,12 @@ public class FieldConstraintsAspect {
 
     /**
      * Returns the measurable length of a value:
-     * {@code String} → character count, {@code Collection} → element count.
+     * <ul>
+     *   <li>{@code String} → character count</li>
+     *   <li>{@code Collection} → element count (covers protobuf repeated fields, returned as
+     *       {@code List<?>} by the Descriptors API)</li>
+     *   <li>{@code com.google.protobuf.ByteString} → byte count (when protobuf is present)</li>
+     * </ul>
      * Returns {@code -1} for unsupported types (warning logged).
      */
     private int measureLength(Object value, String fieldName) {
@@ -160,6 +210,9 @@ public class FieldConstraintsAspect {
         }
         if (value instanceof Collection<?> c) {
             return c.size();
+        }
+        if (PROTOBUF_PRESENT && value instanceof com.google.protobuf.ByteString bs) {
+            return bs.size();
         }
         log.warn("@FieldRule min/max on field '{}' — unsupported type {}. Length check skipped.",
                 fieldName, value.getClass().getSimpleName());
