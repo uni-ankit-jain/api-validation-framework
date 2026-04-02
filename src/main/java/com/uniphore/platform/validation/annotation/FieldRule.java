@@ -6,14 +6,26 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Declares an allowed-values rule for a single request body field.
+ * Declares validation rules for a single request body field.
  * Used only as a member of {@link FieldConstraints}.
  *
- * <p>Example:
+ * <p>Each rule can enforce allowed values, a length constraint, or both.
+ * Omit any attribute that is not needed — defaults mean "no constraint".
+ *
+ * <p>Examples:
  * <pre>{@code
  * @FieldConstraints({
- *     @FieldRule(field = "status", values = {"ACTIVE", "INACTIVE"}),
- *     @FieldRule(field = "priority", values = {"LOW", "MEDIUM", "HIGH"}, ignoreCase = true)
+ *     // allowed-values only
+ *     @FieldRule(field = "status",      values = {"ACTIVE", "INACTIVE"}),
+ *
+ *     // length only
+ *     @FieldRule(field = "name",        min = 2, max = 100),
+ *
+ *     // both
+ *     @FieldRule(field = "countryCode", values = {"US", "IN", "GB"}, min = 2, max = 2),
+ *
+ *     // case-insensitive allowed-values
+ *     @FieldRule(field = "priority",    values = {"low", "medium", "high"}, ignoreCase = true)
  * })
  * }</pre>
  */
@@ -25,18 +37,35 @@ public @interface FieldRule {
     /** Name of the field in the request body object. */
     String field();
 
-    /** Exhaustive list of allowed values for the field. */
-    String[] values();
+    /**
+     * Exhaustive list of allowed values for the field.
+     * When empty (the default), no value constraint is applied.
+     */
+    String[] values() default {};
 
     /**
-     * When {@code true}, comparison is case-insensitive.
+     * When {@code true}, allowed-values comparison is case-insensitive.
      * Defaults to {@code false}.
      */
     boolean ignoreCase() default false;
 
     /**
-     * Custom error message. If left empty, a default message is generated:
-     * "Value '&lt;actual&gt;' is not allowed. Allowed: [values]"
+     * Minimum field length (inclusive).
+     * For {@code String} fields — character count; for {@code Collection} fields — element count.
+     * {@code -1} (the default) means no minimum is enforced.
+     */
+    int min() default -1;
+
+    /**
+     * Maximum field length (inclusive).
+     * For {@code String} fields — character count; for {@code Collection} fields — element count.
+     * {@code -1} (the default) means no maximum is enforced.
+     */
+    int max() default -1;
+
+    /**
+     * Custom error message. When blank, a default message is generated.
+     * Applies to both value and length violations on this field.
      */
     String message() default "";
 }
