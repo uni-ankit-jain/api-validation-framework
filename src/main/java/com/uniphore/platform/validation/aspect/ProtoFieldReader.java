@@ -5,6 +5,9 @@ import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.Message;
 import org.slf4j.Logger;
 
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * Protobuf field-access helper for {@link FieldConstraintsAspect}.
  *
@@ -37,6 +40,10 @@ final class ProtoFieldReader {
 
     private ProtoFieldReader() {}
 
+    // Cached FieldDescriptor per "MessageFullName#fieldName" — avoids per-request descriptor lookup
+    private static final ConcurrentHashMap<String, Optional<FieldDescriptor>> descriptorCache =
+            new ConcurrentHashMap<>();
+
     /** Returns {@code true} when {@code target} is a protobuf {@link Message}. */
     static boolean isProtoMessage(Object target) {
         return target instanceof Message;
@@ -60,7 +67,10 @@ final class ProtoFieldReader {
         String[] parts = fieldPath.split("\\.", 2);
         String name = parts[0];
 
-        FieldDescriptor fd = message.getDescriptorForType().findFieldByName(name);
+        String descriptorKey = message.getDescriptorForType().getFullName() + "#" + name;
+        FieldDescriptor fd = descriptorCache.computeIfAbsent(descriptorKey,
+                k -> Optional.ofNullable(message.getDescriptorForType().findFieldByName(name))
+        ).orElse(null);
         if (fd == null) {
             log.warn("Protobuf field '{}' not found in {}. Rule will be skipped.",
                     name, message.getDescriptorForType().getName());

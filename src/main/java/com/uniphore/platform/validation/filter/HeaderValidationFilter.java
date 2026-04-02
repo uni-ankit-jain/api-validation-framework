@@ -15,8 +15,12 @@ import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -43,10 +47,25 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
     private final RequestMappingHandlerMapping handlerMapping;
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
 
+    // Resolved @HeaderConstraints per method (method-level wins over class-level)
+    private final ConcurrentHashMap<Method, Optional<HeaderConstraints>> headerConstraintsCache = new ConcurrentHashMap<>();
+
+    // Cached lowercased effective content-type lists per method (for per-endpoint annotation overrides)
+    private final ConcurrentHashMap<Method, List<String>> effectiveContentTypesCache = new ConcurrentHashMap<>();
+
+    // Bypass-path match result per request URI — avoids repeated AntPathMatcher evaluation
+    private final ConcurrentHashMap<String, Boolean> bypassPathCache = new ConcurrentHashMap<>();
+
+    // Global allowed content types pre-lowercased at construction time
+    private final List<String> globalAllowedContentTypesLower;
+
     public HeaderValidationFilter(ValidationProperties properties,
                                   RequestMappingHandlerMapping handlerMapping) {
         this.properties = properties;
         this.handlerMapping = handlerMapping;
+        this.globalAllowedContentTypesLower = properties.getContentType().getAllowedTypes().stream()
+                .map(String::toLowerCase)
+                .collect(Collectors.toUnmodifiableList());
     }
 
     @Override
@@ -82,11 +101,7 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
         // @HeaderConstraints.allowedContentTypes overrides the global list when non-empty
         if (properties.getContentType().isValidateOnMutating()
                 && MUTATING_METHODS.contains(request.getMethod().toUpperCase())) {
-            List<String> effectiveContentTypes =
-                    (headerConstraints != null && headerConstraints.allowedContentTypes().length > 0)
-                            ? Arrays.asList(headerConstraints.allowedContentTypes())
-                            : properties.getContentType().getAllowedTypes();
-            validateContentType(request, effectiveContentTypes);
+            validateContentType(request, resolveEffectiveContentTypes(handlerMethod, headerConstraints));
         }
 
         // Step 5 — validate globally required custom headers (from properties)
@@ -134,8 +149,9 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
     }
 
     private boolean isBypassPath(String path) {
-        return properties.getBypassPaths().stream()
-                .anyMatch(pattern -> pathMatcher.match(pattern, path));
+        return bypassPathCache.computeIfAbsent(path,
+                p -> properties.getBypassPaths().stream()
+                        .anyMatch(pattern -> pathMatcher.match(pattern, p)));
     }
 
     private HandlerMethod resolveHandlerMethod(HttpServletRequest request) {
@@ -180,7 +196,8 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
         }
     }
 
-    private void validateContentType(HttpServletRequest request, List<String> allowed) {
+    /** {@code allowedLower} must already be lowercased — call {@link #resolveEffectiveContentTypes} to obtain it. */
+    private void validateContentType(HttpServletRequest request, List<String> allowedLower) {
         String contentType = request.getContentType();
         if (contentType == null || contentType.isBlank()) {
             throw new HeaderValidationException(
@@ -188,29 +205,48 @@ public class HeaderValidationFilter extends OncePerRequestFilter {
                     HttpStatus.BAD_REQUEST,
                     "Content-Type");
         }
-        // Prefix match — allows "application/json; charset=UTF-8"
-        boolean matched = allowed.stream()
-                .anyMatch(type -> contentType.toLowerCase().startsWith(type.toLowerCase()));
+        // Lowercase once; prefix match allows "application/json; charset=UTF-8"
+        String contentTypeLower = contentType.toLowerCase();
+        boolean matched = allowedLower.stream().anyMatch(contentTypeLower::startsWith);
         if (!matched) {
             throw new HeaderValidationException(
-                    "Content-Type '" + contentType + "' is not allowed. Allowed types: " + allowed,
+                    "Content-Type '" + contentType + "' is not allowed. Allowed types: " + allowedLower,
                     HttpStatus.BAD_REQUEST,
                     "Content-Type");
         }
     }
 
     /**
+     * Returns the effective (pre-lowercased) allowed content-type list for the request.
+     * Per-endpoint annotation overrides are cached; falls back to the global list.
+     */
+    private List<String> resolveEffectiveContentTypes(HandlerMethod handlerMethod,
+                                                      HeaderConstraints headerConstraints) {
+        if (headerConstraints == null || headerConstraints.allowedContentTypes().length == 0
+                || handlerMethod == null) {
+            return globalAllowedContentTypesLower;
+        }
+        return effectiveContentTypesCache.computeIfAbsent(handlerMethod.getMethod(), m ->
+            Arrays.stream(headerConstraints.allowedContentTypes())
+                    .map(String::toLowerCase)
+                    .collect(Collectors.toUnmodifiableList())
+        );
+    }
+
+    /**
      * Returns the effective {@link HeaderConstraints} for the given handler method.
-     * Method-level annotation takes full precedence over class-level.
+     * Method-level annotation takes full precedence over class-level. Result is cached per method.
      */
     private HeaderConstraints resolveHeaderConstraints(HandlerMethod handlerMethod) {
         if (handlerMethod == null) {
             return null;
         }
-        HeaderConstraints methodLevel = handlerMethod.getMethodAnnotation(HeaderConstraints.class);
-        if (methodLevel != null) {
-            return methodLevel;
-        }
-        return handlerMethod.getBeanType().getAnnotation(HeaderConstraints.class);
+        return headerConstraintsCache.computeIfAbsent(handlerMethod.getMethod(), m -> {
+            HeaderConstraints methodLevel = handlerMethod.getMethodAnnotation(HeaderConstraints.class);
+            if (methodLevel != null) {
+                return Optional.of(methodLevel);
+            }
+            return Optional.ofNullable(handlerMethod.getBeanType().getAnnotation(HeaderConstraints.class));
+        }).orElse(null);
     }
 }

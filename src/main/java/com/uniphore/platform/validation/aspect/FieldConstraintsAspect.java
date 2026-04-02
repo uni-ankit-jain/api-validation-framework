@@ -20,7 +20,9 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +60,15 @@ public class FieldConstraintsAspect {
      * (and does not cause {@link NoClassDefFoundError}) when protobuf-java is absent.
      */
     private static final boolean PROTOBUF_PRESENT;
+
+    // Annotation resolved per method (method-level wins over class-level)
+    private final ConcurrentHashMap<Method, Optional<FieldConstraints>> annotationCache = new ConcurrentHashMap<>();
+
+    // Cached reflected Field per "ClassName#fieldName" — eliminates per-request class hierarchy walk
+    private final ConcurrentHashMap<String, Optional<Field>> fieldCache = new ConcurrentHashMap<>();
+
+    // Cached allowed-value sets per @FieldRule instance — annotation instances are stable class metadata
+    private final ConcurrentHashMap<FieldRule, Set<String>> allowedSetCache = new ConcurrentHashMap<>();
 
     static {
         boolean present = false;
@@ -131,14 +142,16 @@ public class FieldConstraintsAspect {
     // Helpers
     // -------------------------------------------------------------------------
 
-    /** Method-level annotation wins over class-level. */
+    /** Method-level annotation wins over class-level. Result is cached per method. */
     private FieldConstraints resolveAnnotation(ProceedingJoinPoint pjp) {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
-        FieldConstraints methodLevel = method.getAnnotation(FieldConstraints.class);
-        if (methodLevel != null) {
-            return methodLevel;
-        }
-        return pjp.getTarget().getClass().getAnnotation(FieldConstraints.class);
+        return annotationCache.computeIfAbsent(method, m -> {
+            FieldConstraints methodLevel = m.getAnnotation(FieldConstraints.class);
+            if (methodLevel != null) {
+                return Optional.of(methodLevel);
+            }
+            return Optional.ofNullable(pjp.getTarget().getClass().getAnnotation(FieldConstraints.class));
+        }).orElse(null);
     }
 
     /** Returns the first argument annotated with {@code @RequestBody}, or {@code null}. */
@@ -174,24 +187,35 @@ public class FieldConstraintsAspect {
             return ProtoFieldReader.readField(target, fieldName, log);
         }
 
-        // POJO path: walk the class hierarchy via reflection
-        Class<?> clazz = target.getClass();
-        while (clazz != null && clazz != Object.class) {
-            try {
-                Field field = clazz.getDeclaredField(fieldName);
-                field.setAccessible(true);
-                return field.get(target);
-            } catch (NoSuchFieldException e) {
-                clazz = clazz.getSuperclass();
-            } catch (IllegalAccessException e) {
-                log.warn("Cannot access field '{}' on {}: {}",
-                        fieldName, target.getClass().getSimpleName(), e.getMessage());
-                return null;
+        // POJO path: walk the class hierarchy once and cache the Field object
+        String cacheKey = target.getClass().getName() + "#" + fieldName;
+        Optional<Field> cached = fieldCache.computeIfAbsent(cacheKey, k -> {
+            Class<?> clazz = target.getClass();
+            while (clazz != null && clazz != Object.class) {
+                try {
+                    Field f = clazz.getDeclaredField(fieldName);
+                    f.setAccessible(true);
+                    return Optional.of(f);
+                } catch (NoSuchFieldException e) {
+                    clazz = clazz.getSuperclass();
+                }
             }
+            return Optional.empty();
+        });
+
+        if (cached.isEmpty()) {
+            log.warn("Field '{}' not found on {}. Rule will be skipped.",
+                    fieldName, target.getClass().getSimpleName());
+            return null;
         }
-        log.warn("Field '{}' not found on {}. Rule will be skipped.",
-                fieldName, target.getClass().getSimpleName());
-        return null;
+
+        try {
+            return cached.get().get(target);
+        } catch (IllegalAccessException e) {
+            log.warn("Cannot access field '{}' on {}: {}",
+                    fieldName, target.getClass().getSimpleName(), e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -233,8 +257,10 @@ public class FieldConstraintsAspect {
     }
 
     private Set<String> buildAllowedSet(FieldRule rule) {
-        return Arrays.stream(rule.values())
-                .map(rule.ignoreCase() ? String::toLowerCase : v -> v)
-                .collect(Collectors.toSet());
+        return allowedSetCache.computeIfAbsent(rule, r ->
+            Arrays.stream(r.values())
+                    .map(r.ignoreCase() ? String::toLowerCase : v -> v)
+                    .collect(Collectors.toUnmodifiableSet())
+        );
     }
 }
